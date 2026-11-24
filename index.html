@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>실시간 영어 단어 골든벨</title>
+  <!-- 외부 서버 없이 P2P 통신을 해주는 무료 라이브러리 -->
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+  <style>
+    body { font-family: 'Malgun Gothic', sans-serif; text-align: center; background: #f0f4f8; margin: 0; padding: 20px; }
+    .box { max-width: 650px; margin: 20px auto; background: white; padding: 30px; border-radius: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    button { padding: 15px 25px; font-size: 18px; border: none; border-radius: 10px; cursor: pointer; margin: 8px; font-weight: bold; transition: 0.2s; }
+    .btn-teacher { background: #2563eb; color: white; }
+    .btn-student { background: #10b981; color: white; }
+    .btn-opt { width: 45%; background: #e2e8f0; color: #1e293b; font-size: 20px; }
+    .btn-opt:hover { background: #cbd5e1; }
+    .btn-opt.selected { background: #2563eb; color: white; }
+    input { padding: 12px; font-size: 18px; border: 2px solid #cbd5e1; border-radius: 8px; width: 200px; text-align: center; margin: 5px; }
+    .hidden { display: none; }
+    .room-code { font-size: 42px; font-weight: 900; color: #2563eb; letter-spacing: 4px; margin: 10px 0; }
+    .student-card { display: inline-block; padding: 12px 18px; margin: 6px; border-radius: 10px; background: #f1f5f9; font-weight: bold; border: 2px solid #cbd5e1; }
+    .student-card.answered { background: #dbeafe; border-color: #2563eb; }
+    .student-card.correct { background: #dcfce7; border-color: #16a34a; color: #15803d; }
+    .student-card.wrong { background: #fee2e2; border-color: #dc2626; color: #b91c1c; }
+    .word-display { font-size: 44px; font-weight: bold; color: #0f172a; margin: 25px 0; }
+  </style>
+</head>
+<body>
+
+  <!-- 1. 초기 역할 선택 화면 -->
+  <div id="role-screen" class="box">
+    <h1>🔔 실시간 영어 단어 골든벨</h1>
+    <p>접속할 역할을 선택해 주세요.</p>
+    <button class="btn-teacher" onclick="initTeacher()">👨‍🏫 선생님 (방 만들기)</button>
+    <button class="btn-student" onclick="showStudentJoin()">🙋‍♂️ 학생 (참여하기)</button>
+  </div>
+
+  <!-- 2. 선생님 대시보드 화면 -->
+  <div id="teacher-screen" class="box hidden">
+    <div>참여 코드: <span id="room-code-display" class="room-code">생성중...</span></div>
+    <p id="teacher-status">학생들이 위 코드를 입력하고 입장할 때까지 기다려주세요.</p>
+    <hr>
+    
+    <!-- 문제 출제 컨트롤 -->
+    <div id="quiz-control">
+      <div id="teacher-word" class="word-display">준비 완료!</div>
+      <div id="teacher-answer-info" style="font-size: 20px; color: #16a34a; font-weight: bold; margin-bottom: 15px;"></div>
+      <button class="btn-teacher" onclick="nextQuestion()">▶️ 다음 문제 출제</button>
+      <button class="btn-student" onclick="revealAnswer()">👀 정답 공개</button>
+    </div>
+    <hr>
+
+    <!-- 실시간 학생 현황판 -->
+    <h3>참여 학생 현황 (<span id="student-count">0</span>명)</h3>
+    <div id="student-list"></div>
+  </div>
+
+  <!-- 3. 학생 입장 화면 -->
+  <div id="student-join-screen" class="box hidden">
+    <h2>골든벨 입장하기</h2>
+    <input type="text" id="input-room-code" placeholder="방 코드 4자리" maxlength="4"><br>
+    <input type="text" id="input-student-name" placeholder="내 이름 입력"><br>
+    <button class="btn-student" onclick="joinRoom()">입장하기</button>
+    <p id="join-error" style="color: red;"></p>
+  </div>
+
+  <!-- 4. 학생 문제 풀이 화면 -->
+  <div id="student-play-screen" class="box hidden">
+    <h3 id="student-header">연결됨</h3>
+    <div id="student-word" class="word-display">선생님이 문제를 출제할 때까지 대기 중...</div>
+    <div id="student-options"></div>
+    <h2 id="student-result-msg"></h2>
+  </div>
+
+  <script>
+    // 샘플 영어 단어 데이터 (원하는 단어로 자유롭게 수정 가능)
+    const quizData = [
+      { word: "apple", options: ["사과", "바나나", "포도", "딸기"], answer: 0 },
+      { word: "adventure", options: ["숙제", "모험", "도서관", "비밀"], answer: 1 },
+      { word: "brave", options: ["슬픈", "게으른", "용감한", "조용한"], answer: 2 },
+      { word: "delicious", options: ["위험한", "어려운", "시끄러운", "맛있는"], answer: 3 },
+      { word: "promise", options: ["약속", "거짓말", "선물", "실수"], answer: 0 }
+    ];
+
+    let peer = null;
+    let connections = {}; // 선생님용: 연결된 학생들 저장
+    let hostConn = null;  // 학생용: 선생님 연결 객체
+    let currentQIndex = -1;
+    let myAnswer = null;
+    let isRevealed = false;
+
+    // ================= 선생님 로직 =================
+    function initTeacher() {
+      document.getElementById('role-screen').classList.add('hidden');
+      document.getElementById('teacher-screen').classList.remove('hidden');
+
+      // 4자리 랜덤 방 코드 생성 (충돌 방지를 위해 접두사 사용)
+      const roomCode = Math.floor(1000 + Math.random() * 9000).toString();
+      peer = new Peer('gb-quiz-' + roomCode);
+
+      peer.on('open', () => {
+        document.getElementById('room-code-display').innerText = roomCode;
+      });
+
+      peer.on('error', (err) => {
+        alert("연결 오류가 발생했습니다. 새로고침 후 다시 시도해주세요: " + err.type);
+      });
+
+      // 학생 접속 수신
+      peer.on('connection', (conn) => {
+        conn.on('data', (data) => {
+          if (data.type === 'JOIN') {
+            connections[conn.peer] = { conn: conn, name: data.name, choice: null };
+            updateStudentBoard();
+          } else if (data.type === 'ANSWER') {
+            if (connections[conn.peer]) {
+              connections[conn.peer].choice = data.choice;
+              updateStudentBoard();
+            }
+          }
+        });
+
+        conn.on('close', () => {
+          delete connections[conn.peer];
+          updateStudentBoard();
+        });
+      });
+    }
+
+    function nextQuestion() {
+      currentQIndex++;
+      if (currentQIndex >= quizData.length) {
+        alert("모든 문제가 끝났습니다! 처음부터 다시 시작합니다.");
+        currentQIndex = 0;
+      }
+      isRevealed = false;
+      const q = quizData[currentQIndex];
+
+      // 선생님 화면 갱신
+      document.getElementById('teacher-word').innerText = `Q${currentQIndex + 1}. ${q.word}`;
+      document.getElementById('teacher-answer-info').innerText = "(정답 숨김 상태)";
+
+      // 학생 선택 기록 초기화 및 문제 전송
+      Object.values(connections).forEach(student => {
+        student.choice = null;
+        student.conn.send({
+          type: 'NEW_QUESTION',
+          qNum: currentQIndex + 1,
+          word: q.word,
+          options: q.options
+        });
+      });
+      updateStudentBoard();
+    }
+
+    function revealAnswer() {
+      if (currentQIndex < 0) return;
+      isRevealed = true;
+      const q = quizData[currentQIndex];
+      document.getElementById('teacher-answer-info').innerText = `정답: ${q.answer + 1}번 (${q.options[q.answer]})`;
+
+      // 학생들에게 정답 공개 신호 전송
+      Object.values(connections).forEach(student => {
+        student.conn.send({
+          type: 'REVEAL',
+          answer: q.answer,
+          answerText: q.options[q.answer]
+        });
+      });
+      updateStudentBoard();
+    }
+
+    function updateStudentBoard() {
+      const listDiv = document.getElementById('student-list');
+      const students = Object.values(connections);
+      document.getElementById('student-count').innerText = students.length;
+      listDiv.innerHTML = '';
+
+      const q = currentQIndex >= 0 ? quizData[currentQIndex] : null;
+
+      students.forEach(st => {
+        const card = document.createElement('div');
+        card.className = 'student-card';
+        let statusText = "고민중...";
+
+        if (st.choice !== null) {
+          card.classList.add('answered');
+          statusText = isRevealed ? `${st.choice + 1}번 (${q.options[st.choice]})` : "제출 완료 ✅";
+        }
+
+        if (isRevealed && q) {
+          if (st.choice === q.answer) {
+            card.className = 'student-card correct';
+            statusText = `⭕ 정답 (${q.options[st.choice]})`;
+          } else {
+            card.className = 'student-card wrong';
+            statusText = st.choice !== null ? `❌ 오답 (${q.options[st.choice]})` : "❌ 미제출";
+          }
+        }
+
+        card.innerHTML = `<div>${st.name}</div><div style="font-size:14px; margin-top:5px;">${statusText}</div>`;
+        listDiv.appendChild(card);
+      });
+    }
+
+    // ================= 학생 로직 =================
+    function showStudentJoin() {
+      document.getElementById('role-screen').classList.add('hidden');
+      document.getElementById('student-join-screen').classList.remove('hidden');
+    }
+
+    function joinRoom() {
+      const code = document.getElementById('input-room-code').value.trim();
+      const name = document.getElementById('input-student-name').value.trim();
+      if (!code || !name) {
+        document.getElementById('join-error').innerText = "방 코드와 이름을 모두 입력해주세요.";
+        return;
+      }
+
+      document.getElementById('join-error').innerText = "연결 중...";
+      peer = new Peer();
+
+      peer.on('open', () => {
+        hostConn = peer.connect('gb-quiz-' + code);
+
+        hostConn.on('open', () => {
+          // 입장 성공 시 화면 전환
+          document.getElementById('student-join-screen').classList.add('hidden');
+          document.getElementById('student-play-screen').classList.remove('hidden');
+          document.getElementById('student-header').innerText = `참가자: ${name}`;
+          hostConn.send({ type: 'JOIN', name: name });
+        });
+
+        hostConn.on('data', (data) => {
+          if (data.type === 'NEW_QUESTION') {
+            myAnswer = null;
+            document.getElementById('student-result-msg').innerText = "";
+            document.getElementById('student-word').innerText = `Q${data.qNum}. ${data.word}`;
+            
+            const optDiv = document.getElementById('student-options');
+            optDiv.innerHTML = '';
+            data.options.forEach((optText, idx) => {
+              const btn = document.createElement('button');
+              btn.className = 'btn-opt';
+              btn.innerText = `${idx + 1}. ${optText}`;
+              btn.onclick = () => selectOption(idx, btn);
+              optDiv.appendChild(btn);
+            });
+          } else if (data.type === 'REVEAL') {
+            // 버튼 비활성화
+            document.querySelectorAll('.btn-opt').forEach(b => b.disabled = true);
+            const msg = document.getElementById('student-result-msg');
+            if (myAnswer === data.answer) {
+              msg.style.color = "#16a34a";
+              msg.innerText = `🎉 정답입니다! (${data.answerText})`;
+            } else {
+              msg.style.color = "#dc2626";
+              msg.innerText = `😢 아쉽네요! 정답은 [${data.answerText}] 입니다.`;
+            }
+          }
+        });
+      });
+
+      peer.on('error', () => {
+        document.getElementById('join-error').innerText = "방을 찾을 수 없거나 학교 와이파이 방화벽에 의해 차단되었습니다.";
+      });
+    }
+
+    function selectOption(idx, btnElement) {
+      myAnswer = idx;
+      document.querySelectorAll('.btn-opt').forEach(b => b.classList.remove('selected'));
+      btnElement.classList.add('selected');
+      hostConn.send({ type: 'ANSWER', choice: idx });
+    }
+  </script>
+</body>
+</html>
